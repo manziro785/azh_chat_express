@@ -2,17 +2,24 @@
 const { Pool } = require("pg");
 require("dotenv").config();
 
-// Support both individual env
+// Neon (like any hosted Postgres) refuses plaintext connections. This used to
+// be keyed off NODE_ENV: if the host didn't set NODE_ENV=production, SSL was
+// silently disabled and every connection failed with a confusing error.
+// The connection target decides instead — only a local database goes without.
+const isLocalDatabase = (url) => /@(localhost|127\.0\.0\.1)[:/]/.test(url);
+
 const pool = process.env.DATABASE_URL
   ? new Pool({
       connectionString: process.env.DATABASE_URL,
-      ssl:
-        process.env.NODE_ENV === "production"
-          ? { rejectUnauthorized: false }
-          : false,
+      ssl: isLocalDatabase(process.env.DATABASE_URL)
+        ? false
+        : { rejectUnauthorized: false },
       max: 20,
       idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 2000,
+      // Neon's free compute suspends after ~5 minutes of inactivity. The first
+      // connection after that has to wake it up, which takes several seconds —
+      // the old 2s timeout turned every cold start into a failed request.
+      connectionTimeoutMillis: 15000,
     })
   : new Pool({
       host: process.env.DB_HOST,
@@ -22,17 +29,19 @@ const pool = process.env.DATABASE_URL
       password: process.env.DB_PASSWORD,
       max: 20,
       idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 2000,
+      connectionTimeoutMillis: 15000,
     });
 
-// Test database connection
 pool.on("connect", () => {
   console.log("✅ Connected to PostgreSQL database");
 });
 
+// Errors on idle clients are normal with a database that suspends when idle:
+// Neon drops the connection, pg removes that client from the pool and moves on.
+// This used to call process.exit(-1), which killed the whole server — sockets,
+// logged-in users and all — every time the database went to sleep.
 pool.on("error", (err) => {
-  console.error("Unexpected error on idle client", err);
-  process.exit(-1);
+  console.error("Idle client error (connection dropped):", err.message);
 });
 
 // Query helper function
